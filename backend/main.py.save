@@ -1,0 +1,220 @@
+import os
+import asyncio
+import json
+import pickle
+import fitz
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from bs4 import BeautifulSoup
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from transformers import pipeline
+
+# Configuration
+os.environ["GOOGLE_API_KEY"] = "AIzaSyAyFvbsVvDeEqqfiisSLU9aQQqZ9-83Wcs"  # Replace with your actual key
+pdf_folder = "/Users/kirtipatel/Downloads/ai_chatbot/backend/data/"
+pdf_files = [os.path.join(pdf_folder, f) for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
+embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+chunks_file = os.path.join(pdf_folder, "pdf_chunks.json")
+dataset_file = os.path.join(pdf_folder, "enhanced_qa_dataset.json")
+index_path = os.path.join(pdf_folder, "faiss_index.pkl")
+
+# NLP Intent Classifier
+classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+
+# Chunking Function
+async def chunk_text(pdf_text, chunk_size=512, overlap=100):
+    if len(pdf_text) <= chunk_size:
+        return [pdf_text]
+    return [pdf_text[i:i + chunk_size] for i in range(0, len(pdf_text), chunk_size - overlap)]
+
+# PDF Text Extraction
+async def extract_text_async(pdf_path, executor):
+    loop = asyncio.get_event_loop()
+    def extract_with_fitz(pdf_path):
+        try:
+            doc = fitz.open(pdf_path)
+            text = "".join(page.get_text("text") or "" for page in doc)
+            doc.close()
+            return text
+        except Exception as e:
+            print(f"⚠️ PyMuPDF failed for {pdf_path}: {e}")
+            return ""
+    return await loop.run_in_executor(executor, extract_with_fitz, pdf_path)
+
+# Fetch Legal Content from Web
+def fetch_legal_web_content(url):
+    try:
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        return soup.get_text()
+    except Exception as e:
+        print(f"⚠️ Failed to fetch web content from {url}: {e}")
+        return ""
+
+# Load and Chunk PDFs + Web Content
+async def load_and_chunk_pdfs():
+    if os.path.exists(chunks_file):
+        with open(chunks_file, "r") as f:
+            pages = json.load(f)
+        print(f"✅ Loaded {len(pages)} chunks from {chunks_file}")
+        return pages
+
+    pages = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        tasks = [extract_text_async(pdf, executor) for pdf in pdf_files]
+        results = await asyncio.gather(*tasks)
+        for pdf, raw_text in zip(pdf_files, results):
+            if raw_text:
+                chunks = await chunk_text(raw_text)
+                pages.extend(chunks)
+                print(f"✅ Processed {pdf} with {len(chunks)} chunks")
+            else:
+                print(f"⚠️ No text extracted from {pdf}, skipping.")
+
+    # Add web content (e.g., Indian Kanoon or legal sites)
+    web_urls = ["https://indiankanoon.org/doc/123456/"]  # Replace with real URLs
+    for url in web_urls:
+        web_text = fetch_legal_web_content(url)
+        if web_text:
+            chunks = await chunk_text(web_text)
+            pages.extend(chunks)
+            print(f"✅ Added {len(chunks)} chunks from {url}")
+
+    with open(chunks_file, "w") as f:
+        json.dump(pages, f)
+    return pages
+
+# Create or Load FAISS Vector Store
+async def create_or_load_vector_store():
+    if os.path.exists(index_path):
+        with open(index_path, "rb") as f:
+            db = pickle.load(f)
+        print(f"✅ Loaded FAISS index from {index_path}")
+    else:
+        pages = await load_and_chunk_pdfs()
+        if not pages:
+            print("❌ No text found in PDFs or web content.")
+            exit()
+        db = FAISS.from_texts(texts=pages, embedding=embedding_model)
+        with open(index_path, "wb") as f:
+            pickle.dump(db, f)
+        print(f"✅ Created and saved FAISS index to {index_path} with {len(pages)} chunks")
+    return db
+
+# Detect Intent of Query
+def detect_intent(query):
+    labels = ["penalty", "procedure", "eligibility", "general"]
+    result = classifier(query, candidate_labels=labels)
+    return result["labels"][0]
+
+# Check if Query is Judiciary-Related
+def is_judiciary_related(query):
+    judiciary_keywords = {
+        "law", "court", "fine", "section", "ipc", "crpc", "motor", "divorce", "contract",
+        "police", "judiciary", "legal", "act", "penalty", "case", "justice"
+    }
+    return any(keyword in query.lower() for keyword in judiciary_keywords) or detect_intent(query) != "general"
+
+# Get Initial Answer from Gemini API
+async def get_gemini_answer(query, user_type="layperson"):
+    try:
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", max_output_tokens=300)
+        prompt = f"""
+        You are an expert in Indian law assisting a {user_type}. Provide a concise answer to the query, referencing Indian statutes (e.g., IPC, Motor Vehicles Act) if applicable. Use bullet points for clarity.
+        Query: {query}
+        """
+        result = await llm.ainvoke(prompt)
+        return result.content.strip()
+    except Exception as e:
+        print(f"⚠️ Gemini API failed: {e}")
+        return "No initial answer available from Gemini."
+
+# Simulated Grok API Call (Replace with real xAI API if available)
+async def get_grok_answer(query):
+    # Placeholder response
+    return "Grok’s response based on web/X search: Under Section 184 of Motor Vehicles Act, drunk driving fines can reach ₹10,000."
+
+# Generate Enhanced Response
+async def generate_enhanced_response(query, db, conversation_history, user_type="layperson"):
+    if not is_judiciary_related(query):
+        return "This chatbot is designed for judiciary-related queries only (e.g., 'Fines for speeding under Motor Vehicles Act'). Please ask a legal question."
+
+    try:
+        # Step 1: Detect intent
+        intent = detect_intent(query)
+        
+        # Step 2: Get initial answers
+        gemini_answer = await get_gemini_answer(query, user_type)
+        grok_answer = await get_grok_answer(query)  # Optional, replace with real API
+
+        # Step 3: Retrieve relevant PDF/web context
+        relevant_docs = await asyncio.to_thread(db.similarity_search, query, k=3)
+        pdf_context = "\n".join(doc.page_content for doc in relevant_docs) if relevant_docs else "No specific PDF/web context available."
+
+        # Step 4: Combine with conversation history
+        history_context = "\n".join(conversation_history[-3:]) if conversation_history else "No prior conversation."
+
+        # Step 5: Generate enhanced response
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", max_output_tokens=300)
+        enhanced_prompt = f"""
+        You are an expert in Indian law assisting a {user_type}. Provide a detailed, practical answer to the query, referencing Indian statutes (e.g., IPC, Motor Vehicles Act) and real-life implications. Use bullet points for clarity. Combine the initial answers with PDF/web context and conversation history. If context is irrelevant, improve the initial answers.
+        Query: {query}
+        Intent: {intent}
+        Initial Gemini Answer: {gemini_answer}
+        Grok Answer (web/X): {grok_answer}
+        PDF/Web Context: {pdf_context}
+        Conversation History: {history_context}
+        """
+        result = await llm.ainvoke(enhanced_prompt)
+        enhanced_answer = result.content.strip()
+
+        # Step 6: Save to dataset
+        dataset_entry = {
+            "query": query,
+            "intent": intent,
+            "gemini_answer": gemini_answer,
+            "grok_answer": grok_answer,
+            "pdf_context": pdf_context,
+            "enhanced_answer": enhanced_answer
+        }
+        if os.path.exists(dataset_file):
+            with open(dataset_file, "r") as f:
+                dataset = json.load(f)
+        else:
+            dataset = []
+        dataset.append(dataset_entry)
+        with open(dataset_file, "w") as f:
+            json.dump(dataset, f, indent=2)
+
+        return enhanced_answer
+    except Exception as e:
+        return f"⚠️ Error generating enhanced response: {e}"
+
+# Main Execution
+async def main():
+    db = await create_or_load_vector_store()
+    conversation_history = []
+    print("\n=== Judiciary AI Chatbot with RAG, Gemini, and Enhanced Features ===")
+    print("Enter a judiciary-related query (e.g., 'What happens if I miss a court date in India?'). Type 'exit' to quit.")
+    
+    # Ask user type once
+    user_type = input("Are you a layperson or lawyer? (default: layperson): ").strip().lower() or "layperson"
+
+    while True:
+        query = input("\n🔍 Enter your query: ").strip()
+        if query.lower() == 'exit':
+            print("👋 Goodbye!")
+            break
+        
+        conversation_history.append(query)
+        enhanced_response = await generate_enhanced_response(query, db, conversation_history, user_type)
+        print("\n--- 🤖 Enhanced Response ---")
+        print(enhanced_response)
+
+if __name__ == "__main__":
+    asyncio.run(main()) 
+
+
+

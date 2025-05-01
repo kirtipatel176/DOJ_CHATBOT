@@ -1,0 +1,12 @@
+# requirements.txt
+asyncio
+beautifulsoup4
+fitz  # or PyMuPDF
+requests
+transformers
+torch
+langchain
+langchain_community
+langchain_google_genai
+langchain_huggingface
+faiss-cpu

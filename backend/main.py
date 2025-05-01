@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # ------------------ Configuration ------------------ #
-os.environ["GOOGLE_API_KEY"] = "AIzaSyAyFvbsVvDeEqqfiisSLU9aQQqZ9-83Wcs"  # Replace with real key
+os.environ["GOOGLE_API_KEY"] = "Gemini_api"  # Replace with real key
 pdf_folder = "/Users/kirtipatel/Downloads/ai_chatbot/backend/data/"
 chunks_file = os.path.join(pdf_folder, "pdf_chunks.json")
 dataset_file = os.path.join(pdf_folder, "enhanced_qa_dataset.json")
